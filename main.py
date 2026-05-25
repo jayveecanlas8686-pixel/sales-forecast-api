@@ -1,90 +1,102 @@
 from fastapi import FastAPI
 from pydantic import BaseModel
 import pandas as pd
-from datetime import timedelta
+import lightgbm as lgb
+from prophet import Prophet
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import mean_absolute_percentage_error
+import numpy as np
 
 app = FastAPI()
 
 class ForecastRequest(BaseModel):
     sales_history: list
-    forecast_horizon_days: int = 30
-
-@app.get("/")
-def root():
-    return {"message": "Sales Forecast API Running"}
 
 @app.post("/forecast")
 def forecast(data: ForecastRequest):
+
     df = pd.DataFrame(data.sales_history)
 
-    if df.empty:
-        return {"status": "error", "message": "No sales history received"}
+    # ---------------------------
+    # CLEAN DATA
+    # ---------------------------
 
-    df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
-    df["Total Sales"] = pd.to_numeric(df["Total Sales"], errors="coerce").fillna(0)
-    df["Quantity"] = pd.to_numeric(df["Quantity"], errors="coerce").fillna(0)
-    df["UnitPrice"] = pd.to_numeric(df.get("UnitPrice", 0), errors="coerce").fillna(0)
-    df["Discount"] = pd.to_numeric(df.get("Discount", 0), errors="coerce").fillna(0)
+    df["Date"] = pd.to_datetime(df["Date"])
+    df["Total Sales"] = pd.to_numeric(df["Total Sales"])
 
-    df = df.dropna(subset=["Date"])
+    # ---------------------------
+    # FEATURE ENGINEERING
+    # ---------------------------
 
-    daily = (
-        df.groupby(["Date", "ProductName", "LocationName"], as_index=False)
-        .agg({
-            "Total Sales": "sum",
-            "Quantity": "sum",
-            "UnitPrice": "mean",
-            "Discount": "mean"
-        })
+    df["day_of_week"] = df["Date"].dt.dayofweek
+    df["month"] = df["Date"].dt.month
+    df["day"] = df["Date"].dt.day
+
+    df["lag_7"] = df["Total Sales"].shift(7)
+    df["lag_30"] = df["Total Sales"].shift(30)
+
+    df["rolling_avg_7"] = df["Total Sales"].rolling(7).mean()
+    df["rolling_avg_30"] = df["Total Sales"].rolling(30).mean()
+
+    df = df.dropna()
+
+    # ---------------------------
+    # TRAIN MODEL
+    # ---------------------------
+
+    features = [
+        "day_of_week",
+        "month",
+        "day",
+        "lag_7",
+        "lag_30",
+        "rolling_avg_7",
+        "rolling_avg_30"
+    ]
+
+    X = df[features]
+    y = df["Total Sales"]
+
+    X_train, X_test, y_train, y_test = train_test_split(
+        X,
+        y,
+        test_size=0.2,
+        shuffle=False
     )
 
-    forecast_results = []
+    model = lgb.LGBMRegressor()
 
-    for (product, location), group in daily.groupby(["ProductName", "LocationName"]):
-        group = group.sort_values("Date")
+    model.fit(X_train, y_train)
 
-        last_date = group["Date"].max()
-        avg_7 = group["Total Sales"].tail(7).mean()
-        avg_30 = group["Total Sales"].tail(30).mean()
-        avg_qty_30 = group["Quantity"].tail(30).mean()
+    predictions = model.predict(X_test)
 
-        if pd.isna(avg_7):
-            avg_7 = 0
-        if pd.isna(avg_30):
-            avg_30 = avg_7
-        if pd.isna(avg_qty_30):
-            avg_qty_30 = 0
+    mape = mean_absolute_percentage_error(y_test, predictions)
 
-        base_forecast = (avg_7 * 0.60) + (avg_30 * 0.40)
+    # ---------------------------
+    # FUTURE FORECAST
+    # ---------------------------
 
-        for i in range(1, data.forecast_horizon_days + 1):
-            target_date = last_date + timedelta(days=i)
+    latest = df.iloc[-1]
 
-            weekend_factor = 0.95 if target_date.weekday() >= 5 else 1.00
-            payday_factor = 1.08 if target_date.day in [15, 30, 31] else 1.00
+    future_data = pd.DataFrame([{
+        "day_of_week": latest["day_of_week"],
+        "month": latest["month"],
+        "day": latest["day"],
+        "lag_7": latest["lag_7"],
+        "lag_30": latest["lag_30"],
+        "rolling_avg_7": latest["rolling_avg_7"],
+        "rolling_avg_30": latest["rolling_avg_30"]
+    }])
 
-            forecast_sales = base_forecast * weekend_factor * payday_factor
-
-            forecast_results.append({
-                "target_date": str(target_date.date()),
-                "ProductName": product,
-                "LocationName": location,
-                "forecast_sales": round(float(forecast_sales), 2),
-                "forecast_quantity": round(float(avg_qty_30), 2),
-                "lower_bound": round(float(forecast_sales * 0.85), 2),
-                "upper_bound": round(float(forecast_sales * 1.15), 2),
-                "confidence_score": 0.75,
-                "drivers": [
-                    "7-day moving average",
-                    "30-day moving average",
-                    "payday adjustment",
-                    "weekend adjustment"
-                ]
-            })
+    future_forecast = model.predict(future_data)[0]
 
     return {
-        "status": "success",
-        "model_used": "Fast Moving Average Forecast",
-        "forecast_count": len(forecast_results),
-        "forecast": forecast_results[:1000]
+        "model_used": "LightGBM",
+        "accuracy": {
+            "mape": round(float(mape), 4)
+        },
+        "forecast": {
+            "forecast_sales": round(float(future_forecast), 2),
+            "confidence_score": round(float(1 - mape), 2)
+        }
     }
