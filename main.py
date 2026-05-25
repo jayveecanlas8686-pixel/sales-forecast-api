@@ -276,7 +276,7 @@ def forecast(payload: ForecastPayload):
         group = group.sort_values("date")
 
         if len(group) < 1:
-      continue
+            continue
 
         last_date = group["date"].max()
 
