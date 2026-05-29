@@ -339,10 +339,7 @@ def forecast(payload: ForecastPayload):
 
         for i, pred_sales in enumerate(preds):
 
-            target_date = (
-                last_date +
-                timedelta(days=i + 1)
-            )
+            target_date = last_date + pd.DateOffset(months=i + 1)
 
             lower = pred_sales * 0.85
             upper = pred_sales * 1.15
